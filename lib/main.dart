@@ -1,9 +1,51 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:fl_chart/fl_chart.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:image_picker/image_picker.dart';
+import 'dart:io';
+import 'services/supabase_storage_service.dart';
+import 'services/supabase_sync_service.dart';
 
 const Color kMintGreen = Color(0xFFD4F4DD);
 
-void main() {
+// Transaction Model
+class Transaction {
+  final String id;
+  final String type; // 'Income' or 'Expense'
+  final double amount;
+  final String category;
+  final String? name; // Investment name (nullable for backward compatibility)
+  final String description;
+  final DateTime date;
+
+  Transaction({
+    required this.id,
+    required this.type,
+    required this.amount,
+    required this.category,
+    this.name, // Made optional
+    required this.description,
+    required this.date,
+  });
+}
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  
+  // Initialize Supabase
+  // TODO: Replace with your Supabase project URL and anon key
+  await Supabase.initialize(
+    url: 'https://ygegatjxgdvirpwfeqru.supabase.co',
+    anonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlnZWdhdGp4Z2R2aXJwd2ZlcXJ1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjE0ODcxMzYsImV4cCI6MjA3NzA2MzEzNn0.mlYKMoEsvtykx6cdAcTOrn8uFo5r3XoZWVrCrX4uTGE',
+    authOptions: const FlutterAuthClientOptions(
+      authFlowType: AuthFlowType.pkce,
+    ),
+  );
+  
+  // Initialize cloud sync
+  await SupabaseSyncService.autoSync();
+  
   runApp(const PortfolioApp());
 }
 
@@ -37,18 +79,222 @@ class MainScreen extends StatefulWidget {
 
 class _MainScreenState extends State<MainScreen> {
   int _currentIndex = 0;
+  List<Transaction> _transactions = [];
+  bool _isSignedIn = false;
+  bool _isLoading = true;
 
-  final List<Widget> _screens = [
+  List<Widget> get _screens => [
     const HomeScreen(),
-    const TransactionsScreen(),
+    TransactionsScreen(transactions: _transactions),
     const AnalyticsScreen(),
-    const ProfileScreen(),
+    ProfileScreen(
+      onSignIn: _handleSignIn,
+      onSignOut: _handleSignOut,
+      isSignedIn: _isSignedIn,
+    ),
   ];
 
   @override
+  void initState() {
+    super.initState();
+    _initializeApp();
+  }
+
+  Future<void> _initializeApp() async {
+    try {
+      // Check if user is signed in
+      final isSignedIn = SupabaseSyncService.isSignedIn;
+      setState(() {
+        _isSignedIn = isSignedIn;
+      });
+
+      if (isSignedIn) {
+        // Load data from cloud
+        await _loadCloudData();
+      } else {
+        // Load local backup
+        await _loadLocalData();
+      }
+    } catch (e) {
+      print('Initialization error: $e');
+      // Fallback to local data
+      await _loadLocalData();
+    } finally {
+      setState(() {
+        _isLoading = false;
+      });
+    }
+  }
+
+  Future<void> _loadCloudData() async {
+    try {
+      final cloudData = await SupabaseSyncService.loadAllData();
+      final transactions = (cloudData['transactions'] as List<dynamic>).cast<Transaction>();
+      setState(() {
+        _transactions = transactions;
+      });
+    } catch (e) {
+      print('Failed to load cloud data: $e');
+      await _loadLocalData();
+    }
+  }
+
+  Future<void> _loadLocalData() async {
+    try {
+      final localTransactions = await SupabaseSyncService.loadLocalBackup();
+      setState(() {
+        _transactions = localTransactions;
+      });
+    } catch (e) {
+      print('Failed to load local data: $e');
+    }
+  }
+
+  void _addTransaction(Transaction transaction) async {
+    setState(() {
+      _transactions.insert(0, transaction); // Add at the beginning
+    });
+
+    // Save locally first
+    await SupabaseSyncService.saveLocalBackup(_transactions);
+
+    // If signed in, sync to cloud
+    if (_isSignedIn) {
+      try {
+        await SupabaseSyncService.saveTransactions(_transactions);
+      } catch (e) {
+        print('Failed to sync to cloud: $e');
+        // Show error to user
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Saved locally. Cloud sync failed: $e'),
+              backgroundColor: Colors.orange,
+            ),
+          );
+        }
+      }
+    }
+  }
+
+  Future<void> _handleSignIn() async {
+    try {
+      setState(() {
+        _isLoading = true;
+      });
+
+      final user = await SupabaseSyncService.signInWithGoogle();
+      if (user != null) {
+        setState(() {
+          _isSignedIn = true;
+        });
+
+        // Sync data to cloud
+        await SupabaseSyncService.syncAllData(_transactions);
+        
+        // Load any existing cloud data
+        await _loadCloudData();
+
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Signed in successfully! Data synced to cloud.'),
+              backgroundColor: Colors.green,
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Sign in failed: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    } finally {
+      setState(() {
+        _isLoading = false;
+      });
+    }
+  }
+
+  Future<void> _handleSignOut() async {
+    try {
+      await SupabaseSyncService.signOut();
+      setState(() {
+        _isSignedIn = false;
+      });
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Signed out successfully!'),
+            backgroundColor: Colors.blue,
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Sign out failed: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
+    if (_isLoading) {
+      return const Scaffold(
+        backgroundColor: Color(0xFF101010),
+        body: Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              CircularProgressIndicator(
+                valueColor: AlwaysStoppedAnimation<Color>(Color(0xFFab9ff2)),
+              ),
+              SizedBox(height: 16),
+              Text(
+                'Loading your portfolio...',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 16,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
     return Scaffold(
       body: _screens[_currentIndex],
+      floatingActionButton: _currentIndex == 1 
+          ? FloatingActionButton(
+              onPressed: () async {
+                final result = await Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) => const AddTransactionScreen(),
+                  ),
+                );
+                if (result != null && result is Transaction) {
+                  _addTransaction(result);
+                }
+              },
+              backgroundColor: const Color(0xFFab9ff2), // New color
+              foregroundColor: Colors.white,
+              elevation: 8,
+              child: const Icon(Icons.add, size: 28),
+            )
+          : null,
+      floatingActionButtonLocation: FloatingActionButtonLocation.endFloat,
       bottomNavigationBar: Container(
         height: 95,
         decoration: BoxDecoration(
@@ -505,7 +751,9 @@ class HomeScreen extends StatelessWidget {
 
 // TRANSACTIONS SCREEN
 class TransactionsScreen extends StatelessWidget {
-  const TransactionsScreen({Key? key}) : super(key: key);
+  final List<Transaction> transactions;
+  
+  const TransactionsScreen({Key? key, required this.transactions}) : super(key: key);
 
   @override
   Widget build(BuildContext context) {
@@ -536,83 +784,69 @@ class TransactionsScreen extends StatelessWidget {
             ),
           ),
           Expanded(
-            child: ListView(
-              padding: const EdgeInsets.symmetric(horizontal: 20),
-              children: [
-                _buildTransactionItem(
-                  'Buy BTC',
-                  'Jan 15, 2024',
-                  '+0.001 BTC',
-                  '~\$25.00',
-                  Colors.green[400]!,
-                  Icons.arrow_downward,
-                ),
-                const SizedBox(height: 12),
-                _buildTransactionItem(
-                  'Sell BTC',
-                  'Jan 16, 2024',
-                  '-0.001 BTC',
-                  '~\$25.00',
-                  Colors.red[400]!,
-                  Icons.arrow_upward,
-                ),
-                const SizedBox(height: 12),
-                _buildTransactionItem(
-                  'Deposit',
-                  'Jan 12, 2024',
-                  '+\$100.00',
-                  'From Bank',
-                  Colors.yellow[700]!,
-                  Icons.arrow_downward,
-                ),
-                const SizedBox(height: 12),
-                _buildTransactionItem(
-                  'Withdrawal',
-                  'Jan 10, 2024',
-                  '-\$50.00',
-                  'To Bank',
-                  Colors.green[400]!,
-                  Icons.arrow_upward,
-                ),
-                const SizedBox(height: 12),
-                _buildTransactionItem(
-                  'Buy AAPL',
-                  'Jan 8, 2024',
-                  '+5 AAPL',
-                  '~\$850.00',
-                  Colors.green[400]!,
-                  Icons.arrow_downward,
-                ),
-                const SizedBox(height: 12),
-                _buildTransactionItem(
-                  'Sell VTSAX',
-                  'Jan 5, 2024',
-                  '-10 VTSAX',
-                  '~\$1200.00',
-                  Colors.red[400]!,
-                  Icons.arrow_upward,
-                ),
-              ],
-            ),
+            child: transactions.isEmpty
+                ? Center(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(
+                          Icons.swap_horiz_rounded,
+                          size: 64,
+                          color: Colors.grey[600],
+                        ),
+                        const SizedBox(height: 16),
+                        Text(
+                          'No transactions yet',
+                          style: TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.w600,
+                            color: Colors.grey[400],
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          'Tap the + button to add your first transaction',
+                          style: TextStyle(
+                            fontSize: 14,
+                            color: Colors.grey[500],
+                          ),
+                          textAlign: TextAlign.center,
+                        ),
+                      ],
+                    ),
+                  )
+                : ListView.builder(
+                    padding: const EdgeInsets.symmetric(horizontal: 20),
+                    itemCount: transactions.length,
+                    itemBuilder: (context, index) {
+                      final transaction = transactions[index];
+                      return Padding(
+                        padding: const EdgeInsets.only(bottom: 12),
+                        child: _buildTransactionCard(transaction),
+                      );
+                    },
+                  ),
           ),
         ],
       ),
     );
   }
 
-  Widget _buildTransactionItem(
-      String title,
-      String date,
-      String amount,
-      String subAmount,
-      Color iconColor,
-      IconData icon,
-      ) {
+  Widget _buildTransactionCard(Transaction transaction) {
+    final isIncome = transaction.type == 'Income';
+    final amountColor = isIncome ? Colors.green[400]! : Colors.red[400]!;
+    final iconColor = isIncome ? Colors.green[400]! : Colors.red[400]!;
+    final icon = isIncome ? Icons.arrow_downward : Icons.arrow_upward;
+    
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         color: const Color(0xFF2A2A2A),
         borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: iconColor.withOpacity(0.3),
+          width: 1,
+        ),
       ),
       child: Row(
         children: [
@@ -620,7 +854,7 @@ class TransactionsScreen extends StatelessWidget {
             width: 48,
             height: 48,
             decoration: BoxDecoration(
-              color: iconColor.withOpacity(0.2),
+              color: iconColor.withOpacity(0.15),
               borderRadius: BorderRadius.circular(12),
             ),
             child: Icon(
@@ -635,7 +869,7 @@ class TransactionsScreen extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  title,
+                  transaction.name ?? 'Unknown Investment',
                   style: const TextStyle(
                     color: Colors.white,
                     fontSize: 16,
@@ -644,12 +878,33 @@ class TransactionsScreen extends StatelessWidget {
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  date,
+                  transaction.category,
+                  style: TextStyle(
+                    color: Colors.grey[400],
+                    fontSize: 12,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  _formatDate(transaction.date),
                   style: const TextStyle(
                     color: Colors.grey,
                     fontSize: 12,
                   ),
                 ),
+                if (transaction.description.isNotEmpty) ...[
+                  const SizedBox(height: 4),
+                  Text(
+                    transaction.description,
+                    style: TextStyle(
+                      color: Colors.grey[400],
+                      fontSize: 12,
+                    ),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ],
               ],
             ),
           ),
@@ -657,21 +912,20 @@ class TransactionsScreen extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.end,
             children: [
               Text(
-                amount,
+                '${isIncome ? '+' : '-'}${transaction.amount.toStringAsFixed(2)}',
                 style: TextStyle(
-                  color: amount.startsWith('+')
-                      ? Colors.green[400]
-                      : Colors.red[400],
+                  color: amountColor,
                   fontSize: 16,
                   fontWeight: FontWeight.bold,
                 ),
               ),
               const SizedBox(height: 4),
               Text(
-                subAmount,
-                style: const TextStyle(
-                  color: Colors.grey,
+                transaction.type,
+                style: TextStyle(
+                  color: Colors.grey[400],
                   fontSize: 12,
+                  fontWeight: FontWeight.w500,
                 ),
               ),
             ],
@@ -679,6 +933,21 @@ class TransactionsScreen extends StatelessWidget {
         ],
       ),
     );
+  }
+
+  String _formatDate(DateTime date) {
+    final now = DateTime.now();
+    final difference = now.difference(date).inDays;
+    
+    if (difference == 0) {
+      return 'Today';
+    } else if (difference == 1) {
+      return 'Yesterday';
+    } else if (difference < 7) {
+      return '${difference} days ago';
+    } else {
+      return '${date.day}/${date.month}/${date.year}';
+    }
   }
 }
 
@@ -1040,23 +1309,650 @@ class AnalyticsScreen extends StatelessWidget {
   }
 }
 
-// PROFILE SCREEN (Placeholder)
-class ProfileScreen extends StatelessWidget {
-  const ProfileScreen({Key? key}) : super(key: key);
+// PROFILE SCREEN with Firebase Storage example
+class ProfileScreen extends StatefulWidget {
+  final VoidCallback? onSignIn;
+  final VoidCallback? onSignOut;
+  final bool isSignedIn;
+
+  const ProfileScreen({
+    Key? key,
+    this.onSignIn,
+    this.onSignOut,
+    this.isSignedIn = false,
+  }) : super(key: key);
+
+  @override
+  State<ProfileScreen> createState() => _ProfileScreenState();
+}
+
+class _ProfileScreenState extends State<ProfileScreen> {
+  File? _selectedImage;
+  String? _imageUrl;
+  bool _isUploading = false;
+  double _uploadProgress = 0.0;
 
   @override
   Widget build(BuildContext context) {
-    return const SafeArea(
-      child: Center(
-        child: Text(
-          'Profile Screen',
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          children: [
+            const Text(
+              'Profile',
+              style: TextStyle(
+                fontSize: 24,
+                fontWeight: FontWeight.bold,
+                color: Colors.white,
+              ),
+            ),
+            const SizedBox(height: 30),
+
+            // Authentication Section
+            Container(
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                color: const Color(0xFF2A2A2A),
+                borderRadius: BorderRadius.circular(16),
+              ),
+              child: Column(
+                children: [
+                  Icon(
+                    widget.isSignedIn ? Icons.cloud_done : Icons.cloud_off,
+                    size: 48,
+                    color: widget.isSignedIn ? Colors.green : Colors.orange,
+                  ),
+                  const SizedBox(height: 16),
+                  Text(
+                    widget.isSignedIn ? 'Cloud Sync Active' : 'Sign in to sync data',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    widget.isSignedIn 
+                        ? 'Your data is synced across all devices'
+                        : 'Sign in with Google to backup and sync your portfolio data',
+                    style: const TextStyle(
+                      color: Colors.grey,
+                      fontSize: 14,
+                    ),
+                    textAlign: TextAlign.center,
+                  ),
+                  const SizedBox(height: 20),
+                  SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton.icon(
+                      onPressed: widget.isSignedIn ? widget.onSignOut : widget.onSignIn,
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: widget.isSignedIn 
+                            ? Colors.red[600] 
+                            : const Color(0xFFab9ff2),
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(vertical: 16),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                      ),
+                      icon: Icon(
+                        widget.isSignedIn ? Icons.logout : Icons.login,
+                      ),
+                      label: Text(
+                        widget.isSignedIn ? 'Sign Out' : 'Sign in with Google',
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            
+            const SizedBox(height: 30),
+            
+            // Profile Image Section
+            Center(
+              child: Stack(
+                children: [
+                  CircleAvatar(
+                    radius: 60,
+                    backgroundColor: const Color(0xFF2A2A2A),
+                    backgroundImage: _imageUrl != null 
+                        ? NetworkImage(_imageUrl!) 
+                        : (_selectedImage != null 
+                            ? FileImage(_selectedImage!) 
+                            : null),
+                    child: _imageUrl == null && _selectedImage == null
+                        ? const Icon(
+                            Icons.person,
+                            size: 60,
+                            color: Colors.grey,
+                          )
+                        : null,
+                  ),
+                  Positioned(
+                    bottom: 0,
+                    right: 0,
+                    child: GestureDetector(
+                      onTap: _pickImage,
+                      child: Container(
+                        padding: const EdgeInsets.all(8),
+                        decoration: const BoxDecoration(
+                          color: Color(0xFFab9ff2),
+                          shape: BoxShape.circle,
+                        ),
+                        child: const Icon(
+                          Icons.camera_alt,
+                          color: Colors.white,
+                          size: 20,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            
+            const SizedBox(height: 20),
+            
+            // Upload Button
+            if (_selectedImage != null && _imageUrl == null)
+              Column(
+                children: [
+                  SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton(
+                      onPressed: _isUploading ? null : _uploadImage,
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFFab9ff2),
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(vertical: 16),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                      ),
+                      child: _isUploading
+                          ? Row(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                const SizedBox(
+                                  width: 20,
+                                  height: 20,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Text('Uploading... ${(_uploadProgress * 100).toInt()}%'),
+                              ],
+                            )
+                          : const Text('Upload to Firebase Storage'),
+                    ),
+                  ),
+                  if (_isUploading) ...[
+                    const SizedBox(height: 12),
+                    LinearProgressIndicator(
+                      value: _uploadProgress,
+                      backgroundColor: Colors.grey[300],
+                      valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFFab9ff2)),
+                    ),
+                  ],
+                ],
+              ),
+            
+            const SizedBox(height: 20),
+            
+            // Firebase Storage Info
+            Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: const Color(0xFF2A2A2A),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Firebase Storage Features:',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    '• Upload profile pictures\n• Store transaction receipts\n• Save portfolio documents\n• Backup user data',
+                    style: TextStyle(
+                      color: Colors.grey,
+                      fontSize: 14,
+                    ),
+                  ),
+                  if (_imageUrl != null) ...[
+                    const SizedBox(height: 12),
+                    const Text(
+                      'Image uploaded successfully!',
+                      style: TextStyle(
+                        color: Colors.green,
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'URL: ${_imageUrl!.substring(0, 50)}...',
+                      style: const TextStyle(
+                        color: Colors.grey,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _pickImage() async {
+    try {
+      final ImagePicker picker = ImagePicker();
+      final XFile? image = await picker.pickImage(
+        source: ImageSource.gallery,
+        maxWidth: 1024,
+        maxHeight: 1024,
+        imageQuality: 80,
+      );
+      
+      if (image != null) {
+        setState(() {
+          _selectedImage = File(image.path);
+          _imageUrl = null; // Reset URL when new image is selected
+        });
+      }
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Error picking image: $e'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
+  }
+
+  Future<void> _uploadImage() async {
+    if (_selectedImage == null) return;
+
+    setState(() {
+      _isUploading = true;
+      _uploadProgress = 0.0;
+    });
+
+    try {
+      final fileName = SupabaseStorageService.generateUniqueFileName(
+        _selectedImage!.path.split('/').last,
+      );
+      final storagePath = 'profile_images/$fileName';
+
+      final downloadUrl = await SupabaseStorageService.uploadFileWithProgress(
+        _selectedImage!,
+        storagePath,
+        (progress) {
+          setState(() {
+            _uploadProgress = progress;
+          });
+        },
+      );
+
+      setState(() {
+        _imageUrl = downloadUrl;
+        _isUploading = false;
+        _uploadProgress = 0.0;
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Image uploaded successfully!'),
+          backgroundColor: Colors.green,
+        ),
+      );
+    } catch (e) {
+      setState(() {
+        _isUploading = false;
+        _uploadProgress = 0.0;
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Upload failed: $e'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
+  }
+}
+
+// ADD TRANSACTION SCREEN
+class AddTransactionScreen extends StatefulWidget {
+  const AddTransactionScreen({Key? key}) : super(key: key);
+
+  @override
+  State<AddTransactionScreen> createState() => _AddTransactionScreenState();
+}
+
+class _AddTransactionScreenState extends State<AddTransactionScreen> {
+  final _formKey = GlobalKey<FormState>();
+  final _amountController = TextEditingController();
+  final _nameController = TextEditingController();
+  final _descriptionController = TextEditingController();
+  
+  String _selectedCategory = 'Stocks';
+  String _selectedType = 'Expense'; // 'Income' or 'Expense'
+  
+  final List<String> _categories = [
+    'Stocks',
+    'Cryptocurrency',
+    'Real Estate',
+    'Mutual Funds',
+    'ETFs',
+    'Bonds',
+    'Commodities',
+    'REITs',
+    'Options',
+    'Futures',
+    'Other',
+  ];
+
+  @override
+  void dispose() {
+    _amountController.dispose();
+    _nameController.dispose();
+    _descriptionController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFF101010),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF101010),
+        elevation: 0,
+        leading: IconButton(
+          onPressed: () => Navigator.pop(context),
+          icon: const Icon(Icons.arrow_back, color: Colors.white),
+        ),
+        title: const Text(
+          'Add Transaction',
           style: TextStyle(
-            fontSize: 24,
-            fontWeight: FontWeight.bold,
             color: Colors.white,
+            fontSize: 20,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+        centerTitle: true,
+      ),
+      body: SafeArea(
+        child: Form(
+          key: _formKey,
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // Transaction Type Selection
+                const Text(
+                  'Transaction Type',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      child: _buildTypeButton('Income', Icons.arrow_downward, Colors.green),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: _buildTypeButton('Expense', Icons.arrow_upward, Colors.red),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 24),
+
+                // Name Field
+                const Text(
+                  'Investment Name',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                TextFormField(
+                  controller: _nameController,
+                  style: const TextStyle(color: Colors.white, fontSize: 16),
+                  decoration: InputDecoration(
+                    hintText: 'e.g., Apple Inc., Bitcoin, Tesla',
+                    hintStyle: TextStyle(color: Colors.grey[400]),
+                    filled: true,
+                    fillColor: const Color(0xFF2A2A2A),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: BorderSide.none,
+                    ),
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+                  ),
+                  validator: (value) {
+                    if (value == null || value.isEmpty) {
+                      return 'Please enter an investment name';
+                    }
+                    return null;
+                  },
+                ),
+                const SizedBox(height: 24),
+
+                // Amount Field
+                const Text(
+                  'Amount',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                TextFormField(
+                  controller: _amountController,
+                  keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                  inputFormatters: [
+                    FilteringTextInputFormatter.allow(RegExp(r'^\d+\.?\d{0,2}')),
+                  ],
+                  style: const TextStyle(color: Colors.white, fontSize: 16),
+                  decoration: InputDecoration(
+                    hintText: 'Enter amount',
+                    hintStyle: TextStyle(color: Colors.grey[400]),
+                    filled: true,
+                    fillColor: const Color(0xFF2A2A2A),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: BorderSide.none,
+                    ),
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+                  ),
+                  validator: (value) {
+                    if (value == null || value.isEmpty) {
+                      return 'Please enter an amount';
+                    }
+                    if (double.tryParse(value) == null) {
+                      return 'Please enter a valid number';
+                    }
+                    return null;
+                  },
+                ),
+                const SizedBox(height: 24),
+
+                // Category Selection
+                const Text(
+                  'Category',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF2A2A2A),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: DropdownButtonHideUnderline(
+                    child: DropdownButton<String>(
+                      value: _selectedCategory,
+                      isExpanded: true,
+                      dropdownColor: const Color(0xFF2A2A2A),
+                      style: const TextStyle(color: Colors.white, fontSize: 16),
+                      icon: const Icon(Icons.keyboard_arrow_down, color: Colors.white),
+                      items: _categories.map((String category) {
+                        return DropdownMenuItem<String>(
+                          value: category,
+                          child: Text(category),
+                        );
+                      }).toList(),
+                      onChanged: (String? newValue) {
+                        setState(() {
+                          _selectedCategory = newValue!;
+                        });
+                      },
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 24),
+
+                // Description Field
+                const Text(
+                  'Description (Optional)',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                TextFormField(
+                  controller: _descriptionController,
+                  style: const TextStyle(color: Colors.white, fontSize: 16),
+                  decoration: InputDecoration(
+                    hintText: 'Add a note...',
+                    hintStyle: TextStyle(color: Colors.grey[400]),
+                    filled: true,
+                    fillColor: const Color(0xFF2A2A2A),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: BorderSide.none,
+                    ),
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+                  ),
+                  maxLines: 3,
+                ),
+                const SizedBox(height: 40),
+
+                // Save Button
+                SizedBox(
+                  width: double.infinity,
+                  height: 56,
+                  child: ElevatedButton(
+                    onPressed: _saveTransaction,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFFab9ff2),
+                      foregroundColor: Colors.white,
+                      elevation: 8,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                    ),
+                    child: const Text(
+                      'Save Transaction',
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),
     );
+  }
+
+  Widget _buildTypeButton(String type, IconData icon, Color color) {
+    final isSelected = _selectedType == type;
+    return GestureDetector(
+      onTap: () {
+        setState(() {
+          _selectedType = type;
+        });
+      },
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 20),
+        decoration: BoxDecoration(
+          color: isSelected ? color.withOpacity(0.2) : const Color(0xFF2A2A2A),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: isSelected ? color : Colors.transparent,
+            width: 2,
+          ),
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(
+              icon,
+              color: isSelected ? color : Colors.grey[400],
+              size: 20,
+            ),
+            const SizedBox(width: 8),
+            Text(
+              type,
+              style: TextStyle(
+                color: isSelected ? color : Colors.grey[400],
+                fontSize: 16,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _saveTransaction() {
+    if (_formKey.currentState!.validate()) {
+      final transaction = Transaction(
+        id: DateTime.now().millisecondsSinceEpoch.toString(),
+        type: _selectedType,
+        amount: double.parse(_amountController.text),
+        category: _selectedCategory,
+        name: _nameController.text,
+        description: _descriptionController.text,
+        date: DateTime.now(),
+      );
+      
+      Navigator.pop(context, transaction);
+    }
   }
 }

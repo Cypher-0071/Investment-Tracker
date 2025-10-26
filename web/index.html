@@ -31,6 +31,28 @@
 
   <title>portfolio</title>
   <link rel="manifest" href="manifest.json">
+  
+  <!-- Firebase SDKs -->
+  <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-storage-compat.js"></script>
+  
+  <!-- Firebase Config -->
+  <script>
+    const firebaseConfig = {
+      apiKey: "AIzaSyBRxHsxUSE5e4CFMThwRdlgwfg6cO3e2xE",
+      authDomain: "investment-tracker-acd02.firebaseapp.com",
+      projectId: "investment-tracker-acd02",
+      storageBucket: "investment-tracker-acd02.firebasestorage.app",
+      messagingSenderId: "427570197141",
+      appId: "1:427570197141:web:635e2043c420ab3c83a19c",
+      measurementId: "G-6T70RW7N6B"
+    };
+    
+    // Initialize Firebase
+    firebase.initializeApp(firebaseConfig);
+  </script>
 </head>
 <body>
   <script src="flutter_bootstrap.js" async></script>
