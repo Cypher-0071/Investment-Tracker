@@ -1,11 +1,21 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:fl_chart/fl_chart.dart';
-import 'package:supabase_flutter/supabase_flutter.dart';
-import 'package:image_picker/image_picker.dart';
+import 'package:supabase_flutter/supabase_flutter.dart' as supa;
 import 'dart:io';
-import 'services/supabase_storage_service.dart';
+import 'dart:async';
 import 'services/supabase_sync_service.dart';
+
+Future<void> signInWithGoogle() async {
+  final supabase = supa.Supabase.instance.client;
+
+  await supabase.auth.signInWithOAuth(
+    supa.OAuthProvider.google,
+    redirectTo: 'io.supabase.portfolio://login-callback',
+  );
+}
+
+
 
 const Color kMintGreen = Color(0xFFD4F4DD);
 
@@ -35,12 +45,9 @@ void main() async {
   
   // Initialize Supabase
   // TODO: Replace with your Supabase project URL and anon key
-  await Supabase.initialize(
+  await supa.Supabase.initialize(
     url: 'https://ygegatjxgdvirpwfeqru.supabase.co',
     anonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlnZWdhdGp4Z2R2aXJwd2ZlcXJ1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjE0ODcxMzYsImV4cCI6MjA3NzA2MzEzNn0.mlYKMoEsvtykx6cdAcTOrn8uFo5r3XoZWVrCrX4uTGE',
-    authOptions: const FlutterAuthClientOptions(
-      authFlowType: AuthFlowType.pkce,
-    ),
   );
   
   // Initialize cloud sync
@@ -82,9 +89,10 @@ class _MainScreenState extends State<MainScreen> {
   List<Transaction> _transactions = [];
   bool _isSignedIn = false;
   bool _isLoading = true;
+  late final StreamSubscription<supa.AuthState> _authSubscription;
 
   List<Widget> get _screens => [
-    const HomeScreen(),
+    HomeScreen(transactions: _transactions),
     TransactionsScreen(transactions: _transactions),
     const AnalyticsScreen(),
     ProfileScreen(
@@ -98,6 +106,27 @@ class _MainScreenState extends State<MainScreen> {
   void initState() {
     super.initState();
     _initializeApp();
+    _authSubscription = supa.Supabase.instance.client.auth.onAuthStateChange.listen((state) async {
+      final session = state.session;
+      final signedInNow = session != null;
+      if (mounted) {
+        setState(() {
+          _isSignedIn = signedInNow;
+        });
+      }
+      if (signedInNow) {
+        try {
+          await SupabaseSyncService.syncAllData(_transactions);
+          await _loadCloudData();
+        } catch (_) {}
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _authSubscription.cancel();
+    super.dispose();
   }
 
   Future<void> _initializeApp() async {
@@ -182,28 +211,7 @@ class _MainScreenState extends State<MainScreen> {
       setState(() {
         _isLoading = true;
       });
-
-      final user = await SupabaseSyncService.signInWithGoogle();
-      if (user != null) {
-        setState(() {
-          _isSignedIn = true;
-        });
-
-        // Sync data to cloud
-        await SupabaseSyncService.syncAllData(_transactions);
-        
-        // Load any existing cloud data
-        await _loadCloudData();
-
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('Signed in successfully! Data synced to cloud.'),
-              backgroundColor: Colors.green,
-            ),
-          );
-        }
-      }
+      await SupabaseSyncService.signInWithGoogle();
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -341,7 +349,28 @@ class _MainScreenState extends State<MainScreen> {
 
 // HOME SCREEN
 class HomeScreen extends StatelessWidget {
-  const HomeScreen({Key? key}) : super(key: key);
+  final List<Transaction> transactions;
+
+  const HomeScreen({Key? key, required this.transactions}) : super(key: key);
+
+  double _computeBalance() {
+    double balance = 0;
+    for (final t in transactions) {
+      balance += t.type == 'Income' ? t.amount : -t.amount;
+    }
+    return balance;
+  }
+
+  double _computeSevenDayDelta() {
+    final now = DateTime.now();
+    double last7 = 0;
+    for (final t in transactions) {
+      if (now.difference(t.date).inDays < 7) {
+        last7 += t.type == 'Income' ? t.amount : -t.amount;
+      }
+    }
+    return last7;
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -383,9 +412,9 @@ class HomeScreen extends StatelessWidget {
             Center(
               child: Column(
                 children: [
-                  const Text(
-                    '\$12,848.13',
-                    style: TextStyle(
+                  Text(
+                    '\$${_computeBalance().toStringAsFixed(2)}',
+                    style: const TextStyle(
                       fontSize: 42,
                       fontWeight: FontWeight.bold,
                       color: Colors.white,
@@ -401,9 +430,9 @@ class HomeScreen extends StatelessWidget {
                           color: kMintGreen.withOpacity(0.25),
                           borderRadius: BorderRadius.circular(8),
                         ),
-                        child: const Text(
-                          '+\$345.70',
-                          style: TextStyle(
+                        child: Text(
+                          '${_computeSevenDayDelta() >= 0 ? '+' : ''}\$${_computeSevenDayDelta().toStringAsFixed(2)}',
+                          style: const TextStyle(
                             color: kMintGreen,
                             fontSize: 12,
                             fontWeight: FontWeight.w700,
@@ -418,7 +447,7 @@ class HomeScreen extends StatelessWidget {
                           borderRadius: BorderRadius.circular(8),
                         ),
                         child: const Text(
-                          '+2.76%',
+                          '7d change',
                           style: TextStyle(
                             color: kMintGreen,
                             fontSize: 12,
@@ -471,9 +500,9 @@ class HomeScreen extends StatelessWidget {
                     ],
                   ),
                   const SizedBox(height: 8),
-                  const Text(
-                    '\$12,848.13',
-                    style: TextStyle(
+                  Text(
+                    '\$${_computeBalance().toStringAsFixed(2)}',
+                    style: const TextStyle(
                       fontSize: 24,
                       fontWeight: FontWeight.bold,
                       color: Colors.white,
@@ -1327,15 +1356,12 @@ class ProfileScreen extends StatefulWidget {
 }
 
 class _ProfileScreenState extends State<ProfileScreen> {
-  File? _selectedImage;
-  String? _imageUrl;
-  bool _isUploading = false;
-  double _uploadProgress = 0.0;
+  
 
   @override
   Widget build(BuildContext context) {
     return SafeArea(
-      child: Padding(
+      child: SingleChildScrollView(
         padding: const EdgeInsets.all(20),
         child: Column(
           children: [
@@ -1410,231 +1436,14 @@ class _ProfileScreenState extends State<ProfileScreen> {
               ),
             ),
             
-            const SizedBox(height: 30),
-            
-            // Profile Image Section
-            Center(
-              child: Stack(
-                children: [
-                  CircleAvatar(
-                    radius: 60,
-                    backgroundColor: const Color(0xFF2A2A2A),
-                    backgroundImage: _imageUrl != null 
-                        ? NetworkImage(_imageUrl!) 
-                        : (_selectedImage != null 
-                            ? FileImage(_selectedImage!) 
-                            : null),
-                    child: _imageUrl == null && _selectedImage == null
-                        ? const Icon(
-                            Icons.person,
-                            size: 60,
-                            color: Colors.grey,
-                          )
-                        : null,
-                  ),
-                  Positioned(
-                    bottom: 0,
-                    right: 0,
-                    child: GestureDetector(
-                      onTap: _pickImage,
-                      child: Container(
-                        padding: const EdgeInsets.all(8),
-                        decoration: const BoxDecoration(
-                          color: Color(0xFFab9ff2),
-                          shape: BoxShape.circle,
-                        ),
-                        child: const Icon(
-                          Icons.camera_alt,
-                          color: Colors.white,
-                          size: 20,
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            
-            const SizedBox(height: 20),
-            
-            // Upload Button
-            if (_selectedImage != null && _imageUrl == null)
-              Column(
-                children: [
-                  SizedBox(
-                    width: double.infinity,
-                    child: ElevatedButton(
-                      onPressed: _isUploading ? null : _uploadImage,
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFFab9ff2),
-                        foregroundColor: Colors.white,
-                        padding: const EdgeInsets.symmetric(vertical: 16),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                      ),
-                      child: _isUploading
-                          ? Row(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                const SizedBox(
-                                  width: 20,
-                                  height: 20,
-                                  child: CircularProgressIndicator(
-                                    strokeWidth: 2,
-                                    valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-                                  ),
-                                ),
-                                const SizedBox(width: 12),
-                                Text('Uploading... ${(_uploadProgress * 100).toInt()}%'),
-                              ],
-                            )
-                          : const Text('Upload to Firebase Storage'),
-                    ),
-                  ),
-                  if (_isUploading) ...[
-                    const SizedBox(height: 12),
-                    LinearProgressIndicator(
-                      value: _uploadProgress,
-                      backgroundColor: Colors.grey[300],
-                      valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFFab9ff2)),
-                    ),
-                  ],
-                ],
-              ),
-            
-            const SizedBox(height: 20),
-            
-            // Firebase Storage Info
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: const Color(0xFF2A2A2A),
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    'Firebase Storage Features:',
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 16,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  const Text(
-                    '• Upload profile pictures\n• Store transaction receipts\n• Save portfolio documents\n• Backup user data',
-                    style: TextStyle(
-                      color: Colors.grey,
-                      fontSize: 14,
-                    ),
-                  ),
-                  if (_imageUrl != null) ...[
-                    const SizedBox(height: 12),
-                    const Text(
-                      'Image uploaded successfully!',
-                      style: TextStyle(
-                        color: Colors.green,
-                        fontSize: 14,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      'URL: ${_imageUrl!.substring(0, 50)}...',
-                      style: const TextStyle(
-                        color: Colors.grey,
-                        fontSize: 12,
-                      ),
-                    ),
-                  ],
-                ],
-              ),
-            ),
+            // Keep profile simple; no image upload or extra cards
           ],
         ),
       ),
     );
   }
 
-  Future<void> _pickImage() async {
-    try {
-      final ImagePicker picker = ImagePicker();
-      final XFile? image = await picker.pickImage(
-        source: ImageSource.gallery,
-        maxWidth: 1024,
-        maxHeight: 1024,
-        imageQuality: 80,
-      );
-      
-      if (image != null) {
-        setState(() {
-          _selectedImage = File(image.path);
-          _imageUrl = null; // Reset URL when new image is selected
-        });
-      }
-    } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Error picking image: $e'),
-          backgroundColor: Colors.red,
-        ),
-      );
-    }
-  }
-
-  Future<void> _uploadImage() async {
-    if (_selectedImage == null) return;
-
-    setState(() {
-      _isUploading = true;
-      _uploadProgress = 0.0;
-    });
-
-    try {
-      final fileName = SupabaseStorageService.generateUniqueFileName(
-        _selectedImage!.path.split('/').last,
-      );
-      final storagePath = 'profile_images/$fileName';
-
-      final downloadUrl = await SupabaseStorageService.uploadFileWithProgress(
-        _selectedImage!,
-        storagePath,
-        (progress) {
-          setState(() {
-            _uploadProgress = progress;
-          });
-        },
-      );
-
-      setState(() {
-        _imageUrl = downloadUrl;
-        _isUploading = false;
-        _uploadProgress = 0.0;
-      });
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Image uploaded successfully!'),
-          backgroundColor: Colors.green,
-        ),
-      );
-    } catch (e) {
-      setState(() {
-        _isUploading = false;
-        _uploadProgress = 0.0;
-      });
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Upload failed: $e'),
-          backgroundColor: Colors.red,
-        ),
-      );
-    }
-  }
+  
 }
 
 // ADD TRANSACTION SCREEN
